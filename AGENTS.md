@@ -1,0 +1,77 @@
+# Repository Engineering Rules
+
+This repository follows the canonical Engineering System:
+https://github.com/datarelay-labs/engineering-system
+
+## XDR owner-assigned direct execution (2026-10-11)
+
+The owner explicitly assigns this `xdr-labs` repository's Engineering System adoption,
+implementation, tests and normal Git/PR/CI review **directly to the Engineering System Chat**.
+It must carry out authorized repository work itself, not stop at a roadmap handoff or
+retarget work to a DataRelay product chat. Respect the current owner's instructions,
+ACTIVE Work Packet and actual branch/HEAD/dirty state; preserve existing product guards.
+Production, destructive, credential/permission, merge/publication and release actions
+retain separate applicable authority. This is an XDR-specific assignment and must not
+be copied into universal Engineering System templates or DataRelay consumer repos.
+
+
+## Context budget
+
+Always read:
+1. `AGENTS.md`
+2. `.engineering/project.yaml`
+
+Read only when relevant:
+- `.engineering/tests.yaml` for implementation/debugging/testing
+- `.engineering/release.yaml` for release/version/artifact work
+- one task-relevant Engineering System standard plus only the product/spec/ADR/runbook material required by the change
+- `standards/PROVIDER_GUIDANCE.md` only when changing the agent harness/governance policy, evaluating provider-specific behavior, or reviewing scaffolding after a material provider/model change
+- Managed Engineering System Python dependencies are pinned in `.engineering/requirements-engineering-system.txt`. Install that exact file before running managed contract CLIs when the environment lacks PyYAML/jsonschema. Managed helpers never auto-install packages or use unpinned dependency versions.
+- `.engineering/knowledge.yaml` when present, for domain routing. Freshness is `python3 tools/knowledge-contract.py check`. Retrieval stays local unless `python3 tools/knowledge-contract.py route` reports `RETRIEVAL=ESCALATE`.
+- `.engineering/runtime.yaml` when validating a running worktree. Resolve health, smoke, E2E, and additive capabilities with `python3 tools/runtime-contract.py check`.
+- `.engineering/skills.yaml` when present, for progressive-disclosure skills/hooks and permission profiles. Validate with `python3 tools/skills-contract.py check`. Authorization is verification-only via `python3 tools/skills-contract.py authorize` against host-administered adapter provenance and fails closed as `BOUNDARY_UNAVAILABLE` when that provenance is unavailable; see `standards/SKILLS.md`. No production HMAC/`bind` mint.
+- `.engineering/verification.yaml` when present, for feature verification maps. Validate with `python3 tools/verification-contract.py check`. `python3 tools/verification-contract.py assess` reads a receipt only, accepts no boundary file, and stays T0/BLOCK. Implementer-produced output is never terminal evidence. T1–T5 requires an in-process TrustedCoordinatorBoundary; a raw dict stays at T0. The map names applicable domains and launch/drive/observe/cleanup references to existing test, runtime, and skill/profile IDs only. The assessor does not execute commands or grant merge, release, or deploy authority. See `standards/QUALITY.md`.
+- Repository security-profile classification is read-only and network-free. From a canonical Engineering System checkout, run `python3 tools/security-profile.py classify --root <repo>` or `python3 tools/security-profile.py audit --root <repo> [--github-fixture <json>]`. Profiles are production-code, development-code, docs-site, empty-preproduct, or NEEDS_INPUT. The tool does not mutate GitHub settings. Desired-state / dry-run / safe-apply eligibility is `python3 tools/security-hardening.py plan|apply --root <repo> [--github-fixture <json>] [--allowed-control <id> ...]`; dry-run is the default. Real GitHub `--execute` re-reads authoritative GitHub-native control state immediately before eligibility/mutation and fails closed on unavailable/ambiguous facts; caller fixture state cannot authorize those native mutations. `--mutation-backend record` is rehearsal only and may report `PLANNED`/`DRY_RUN`, never real `APPLIED`. Any custom authoritative mutator must provide fresh observed state and declare `network_boundary=GITHUB_SETTINGS`; otherwise execute fails closed. See `standards/SECURITY.md`.
+
+Use the minimum sufficient context and reasoning. Expand only for a concrete blocker, failed check, or unresolved design question. Do not preload all standards, Wiki pages, archives, historical discussions, or old agent transcripts.
+
+When resuming, reconcile current owner intent, priority, dependencies and branch context; select eligible work and verify actual repository state before acting.
+
+## Execution rules
+
+- **Product execution ownership / supervisor fallback:** the product context owns product work. Engineering System owns shared policy, adoption and systemic recovery, including uncontrolled Issue proliferation. Repair only what restores product autonomy, then return ownership. Never mutate an actively progressing owner-authorized worker dirty worktree or create a competing product lane.
+- **Next-chat bootstrap fast path:** perform one bounded lookup when resuming durable work. With no ACTIVE packet, inspect current roadmap/Git/PR facts once and enter safe owner-authorized work; create or repair one packet when continuity needs it, not as a permission prerequisite. `NO_ACTIVE_PACKET` is a scheduling input, not a blocker.
+- **Verified next-chat resume:** re-read the current Issue and mutable repo/worktree/HEAD/profile once; if unchanged, enter the persisted Next Action immediately. Do not replay handoff validation, rewrite unchanged state or reconstruct transcripts. Revalidate only changed facts.
+- Classify the change and affected domains/contracts/security/operations.
+- Before implementation or optional adapter handoff, apply the canonical Work Packet sizing contract: do not map one GitHub Issue to one implementation job by default; `BATCH` adjacent micro-issues/findings, `KEEP` one medium-sized coherent outcome, and `SPLIT` unrelated or context-exhausting scope. Preserve enough context for implementation plus deterministic validation. Record the decision with `python3 tools/work_admission.py size` when the coordinator needs machine-readable evidence.
+- **Execution profile authority:** `.engineering/execution-profile.yaml` selects the runtime unless the current explicit owner instruction overrides it. A continue/resume request authorizes direct implementation, testing, audit and ordinary Git/GitHub work; no additional magic phrase or alternate-runtime handoff is required. Historical prose and retired adapters do not select a runtime. Before claiming missing tools or access, discover the connected task-relevant tools and attempt a minimal authorized action when exposed. Reuse successful same-session, same-target, same-action evidence unless a fresh failure or scope change invalidates it. Report the exact attempted operation and observed error; unattempted is not denied. Existing approvals and explicit tool denials remain binding.
+- **XDR-specific Work Packet binding:** A Work Packet specifies `EXECUTION_PROFILE` and `EXECUTION_PROFILE_REVISION`; stale packets do not override explicit owner intent, execution profile or stricter product safety rules.
+- **Execute useful work continuously.** **Execution authority precedence:** the current explicit owner instruction governs, then the fresh Work Packet, execution profile and repository rules. Historical Issue comments and prior handoffs are evidence only and never execution authority. Bind the owner-selected repository and verify actual branch/HEAD/worktree before mutation; cross-project references never retarget work without explicit owner scope. Implement, test and audit in coherent batches; make measurable progress in the same turn. Repair stale coordination state within owner scope instead of stopping. Advance independent work during machine-observable waits instead of polling; after a bounded task return to roadmap priority. While this turn can execute, continue until the requested roadmap/release objective is complete, no safe runnable work remains, genuine owner input is needed, or a real platform/tool/safety boundary stops execution. Attempt the next safe authorized action before giving a progress-only report, and reselect roadmap work after each verified batch. If work remains when this turn ends, preserve actual progress and the precise Next Action and report the incomplete state without claiming background execution. `tools/work_admission.py disposition` is an optional pure scheduling diagnostic; its `FINAL_ALLOWED` value cannot control the lifecycle of a ChatGPT response. Status-only requests are exempt.
+- Default remains sequential. Before starting a second worker, run `python3 tools/work_admission.py admit` against claim/worktree/resource facts and obey DENY. Never stop or mutate unrelated sessions to create capacity.
+- The selected implementation runtime may perform implementation and terminal audit in the same context. Self-report alone is never enough: terminal PASS requires exact-HEAD deterministic evidence, current CI/review state when applicable, and disposition of actionable findings. For HIGH/CRITICAL, widen affected/security/rollback/runtime evidence and preserve any mandatory human approval. `python3 tools/independent_verifier.py verify`, Codex, or another distinct reviewer is optional defense-in-depth/escalation, not a default completion dependency.
+- **Engineering truth and owner notification are separate states.** Exact-HEAD tests/review/release evidence determines `ENGINEERING_COMPLETE=PASS|BLOCK`; Telegram is the owner-notification transport, not an engineering correctness oracle. For a bounded COMPLETE outcome, attempt one verified notification through `python3 tools/terminal_completion_notify.py` bound to the exact repository, workstream, and terminal HEAD and record `OWNER_NOTIFICATION=PASS|RETRY_PENDING`. Delivery failure must not rewrite a valid engineering PASS into a code/quality failure; it remains an operational notification obligation to retry. Intermediate commands, individual test invocations, and micro-steps do not notify. A genuine owner-action/credential/permission/infrastructure/irreconcilable blocker may send one BLOCKED notification before returning control; ordinary CI waiting, retries, or work the selected runtime can perform itself are not blockers.
+- For ordinary authenticated GitHub Issue/PR coordination, re-read the intended target, branch/HEAD and any packet relied on before writing; reconcile ambiguous outcomes before retrying. Stronger trusted boundaries apply only to effect classes production, destructive, credential/permission change, irreversible publication and release authority, or stricter project policy; follow `standards/SECURITY.md`.
+- Treat the Work Packet `Next Action` as the next bounded outcome/execution bundle with a completion oracle, not a micro-step. Keep tangential discoveries in linked follow-up Issues unless the coordinator explicitly re-sizes the active packet; repeated materially identical failures require a strategy change rather than blind retry.
+- Apply the canonical sufficiency gate: once the completion contract passes and no blocking finding remains, stop that workstream and return to roadmap priority. Do not continue open-ended hardening/auditing for non-blocking improvements; record them as follow-up work.
+- Use Work Packet priority only for scheduling and `CHANGE_RISK` only for verification depth. Before finalizing mutable or external actions, reject stale workers by re-checking the current Work Packet intent revision and mutable evidence; reconcile ambiguous mutating outcomes before retrying.
+- For external agent tools/MCP/plugins, follow the canonical security provenance/authority and agent-tool ergonomics rules; expose only the minimum task-relevant toolset.
+- Apply `standards/DESIGN.md` for material design-bearing changes.
+- Apply `standards/OPERATIONS.md` for production-impacting failures and preserve evidence before mutation. Check an Incident Packet with `python3 tools/incident-evidence.py check-packet` and capture bounded read-only core evidence with `python3 tools/incident-evidence.py capture` from the canonical Engineering System checkout before mutation. Incident Packet state never grants execution authority; `SAFETY_FREEZE=ON` only narrows it. Collect one authorized runtime evidence command with `python3 tools/runtime_evidence.py collect`.
+- Inspect affected implementation/tests and make the smallest correct change.
+- On an existing branch or PR, start with `git diff --name-only`/`git diff --stat` against the base and inspect changed files first; expand to call-sites/dependencies only when evidence requires it.
+- Treat `.engineering/tests.yaml` as an ordered-cost manifest, not a list to execute from the first entry: prefer `agent_default: true` and the lowest explicit `cost`; when metadata is absent, treat static/unit as cheap, component/feature as medium, and integration/lifecycle/performance/e2e as expensive. Do not auto-run expensive/full checks for metadata-only changes.
+- For verbose commands, write full output to a log file and return only exit status plus focused `grep`/`tail` evidence; read more only on failure or ambiguity.
+- Run the cheapest affected deterministic validation first.
+- Do not duplicate equivalent native/shared CI or run expensive downstream qualification after a blocking deterministic failure.
+- Add durable regression coverage for bugs when practical.
+- Never weaken validation or claim PASS from unexecuted, blocked, historical, or different-HEAD evidence.
+- For `project.user_facing: true`, require Surface Reconciliation and Full User E2E on the same exact candidate. Before either named gate, read its entire current repository-local contract. The default `AI_DIRECT` acting user is the selected ChatGPT runtime; only with the current owner's explicit opt-in may the human owner physically operate the real public surface under `HUMAN_OWNER_WITH_CHATGPT_AUDIT`, with ChatGPT still independently auditing evidence. No caller-authored receipt or script grants real user-gate PASS. Drivers/scripts cannot substitute synthetic PASS. Follow `standards/USER_ACCEPTANCE.md`; close findings with affected reruns, then one fresh complete confirmation.
+- Before merge or terminal completion, resolve every actionable review finding with revalidation or an evidence-backed disposition.
+- Preserve machine-observable wait state and continue independent authorized work; use a watcher when useful.
+- Repair missing or contradictory coordination context within current owner scope; otherwise block only the affected action with concrete evidence.
+
+For adoption or managed upgrades, follow `standards/ADOPTION.md`, preserve project-specific/stricter rules, and qualify the result deterministically.
+
+Adopted projects pin `engineering_system.version` and an immutable `engineering_system.baseline` SHA in `.engineering/project.yaml`. Managed upgrades must keep that version/baseline identity aligned with the canonical Engineering System release (currently 1.7.0) rather than assuming same-major pins are current.
+
+Tool-specific adapters may change syntax but must not weaken these rules.

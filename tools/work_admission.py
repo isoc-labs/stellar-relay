@@ -1,0 +1,1179 @@
+#!/usr/bin/env python3
+"""Deterministic parallel-work admission, WIP ownership, and handoff sizing.
+
+Coordinator-facing oracle for whether a second worker may start. Decisions are
+pure functions over packet/claim/worktree/resource facts. This tool never
+stops, kills, attaches to, or otherwise mutates existing worker sessions.
+
+Commands:
+  select      Detect priority drift and preserve the first unfinished action
+  eligible    ALLOW/DENY runnable packet selection from fresh packet and observed facts
+  disposition Optional CONTINUE/RECONCILE/ALLOW_FINAL/BLOCKED scheduling classification
+  admit       ALLOW/DENY starting a proposed worker claim
+  size        BATCH/KEEP/SPLIT handoff sizing from structured signals
+  release     ALLOW/DENY claim release or worktree cleanup reconciliation
+
+Exit status:
+  0  ALLOW (or sizing decision emitted)
+  2  DENY for an explicit policy reason
+  3  BLOCK because facts were missing, malformed, or ambiguous
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import posixpath
+import re
+import sys
+from pathlib import Path
+from typing import Any
+
+ACTIVE_CLAIM_STATUSES = frozenset(
+    {"CLAIMED", "ACTIVE", "WAIT", "YIELD", "RETRY"}
+)
+RELEASEABLE_CLAIM_STATUSES = frozenset(
+    {"COMPLETE", "ABANDON", "SUPERSEDED", "RELEASED"}
+)
+KNOWN_CLAIM_STATUSES = ACTIVE_CLAIM_STATUSES | RELEASEABLE_CLAIM_STATUSES
+HOST_OK = frozenset({"PASS", "WARN"})
+EFFORT_BANDS = frozenset({"micro", "keep", "oversize"})
+SIZING_DECISIONS = frozenset({"BATCH", "KEEP", "SPLIT"})
+
+REPORT_KEYS_ADMIT = (
+    "DECISION",
+    "EXIT_CODE",
+    "REASON",
+    "DENY_CLASS",
+    "PROPOSED_CLAIM_ID",
+    "ACTIVE_CLAIM_COUNT",
+    "WIP_LIMIT",
+    "HOST_RESOURCE_RESULT",
+    "MUTATES_EXISTING_SESSIONS",
+)
+REPORT_KEYS_SIZE = (
+    "DECISION",
+    "EXIT_CODE",
+    "REASON",
+    "WORK_PACKET_SIZING",
+    "PRIMARY_OUTCOME_COUNT",
+    "EFFORT_BAND",
+    "CONTEXT_BUDGET_OK",
+)
+REPORT_KEYS_RELEASE = (
+    "DECISION",
+    "EXIT_CODE",
+    "REASON",
+    "DENY_CLASS",
+    "ACTION",
+    "CLAIM_ID",
+    "MUTATES_EXISTING_SESSIONS",
+)
+
+REPORT_KEYS_PRIORITY = (
+    "SELECTION",
+    "REASON",
+    "REQUIRED_WORKSTREAM",
+    "PROPOSED_WORKSTREAM",
+    "ISSUE_NUMBER",
+    "PRIORITY",
+    "INTENT_REVISION",
+    "NEXT_ACTION",
+    "SKIPPED_FOCUS",
+    "SKIPPED_REASON",
+    "FACT_AUTHORITY",
+    "MUTATES_EXISTING_SESSIONS",
+)
+
+PRIORITY_RANK = {"URGENT": 0, "HIGH": 1, "NORMAL": 2, "LOW": 3}
+PRIORITY_RECONCILE_DENIALS = frozenset(
+    {"INVALID_PACKET", "BRANCH_MISMATCH", "STALE_HEAD", "WORKTREE_MISMATCH", "NO_NEXT_ACTION"}
+)
+PRIORITY_NONRUNNABLE_DENIALS = frozenset(
+    {"NOT_ACTIVE", "CLOSED_ISSUE", "WAITING", "PACKET_BLOCKER"}
+)
+
+REPORT_KEYS_DISPOSITION = (
+    "TURN_DISPOSITION",
+    "FINAL_ALLOWED",
+    "REASON",
+    "REQUEST_SCOPE",
+    "SCHEDULER_RECONCILED",
+    "REMAINING_STATE",
+    "CANDIDATE_COUNT",
+    "RUNNABLE_CANDIDATE_COUNT",
+    "ROADMAP_COMPLETE",
+    "MUTATES_EXISTING_SESSIONS",
+)
+
+TURN_REQUEST_SCOPES = frozenset({"repository", "workstream", "status-only"})
+TURN_REMAINING_STATES = frozenset(
+    {"COMPLETE", "NO_SAFE_RUNNABLE", "OWNER_REQUIRED", "IRRECONCILABLE", "UNKNOWN"}
+)
+TURN_RECONCILE_DENY_CLASSES = frozenset(
+    {
+        "INVALID_PACKET",
+        "CLOSED_ISSUE",
+        "NOT_ACTIVE",
+        "WORKTREE_MISMATCH",
+        "BRANCH_MISMATCH",
+        "STALE_HEAD",
+        "NO_NEXT_ACTION",
+    }
+)
+
+
+class AdmissionFactsError(Exception):
+    def __init__(self, reason: str, deny_class: str = "AMBIGUOUS_FACTS"):
+        super().__init__(reason)
+        self.reason = reason
+        self.deny_class = deny_class
+
+
+def _require_mapping(value: Any, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise AdmissionFactsError(f"{label} must be a JSON object")
+    return value
+
+
+def _require_str(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise AdmissionFactsError(f"{label} must be a non-empty string")
+    return value.strip()
+
+
+def _require_int(value: Any, label: str, *, minimum: int | None = None) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise AdmissionFactsError(f"{label} must be an integer")
+    if minimum is not None and value < minimum:
+        raise AdmissionFactsError(f"{label} must be >= {minimum}")
+    return value
+
+
+def _require_bool(value: Any, label: str) -> bool:
+    if not isinstance(value, bool):
+        raise AdmissionFactsError(f"{label} must be a boolean")
+    return value
+
+
+def _require_list(value: Any, label: str) -> list[Any]:
+    if not isinstance(value, list):
+        raise AdmissionFactsError(f"{label} must be a JSON array")
+    return value
+
+
+def normalize_path(value: str) -> str:
+    """Canonicalize a repository-relative owned path.
+
+    Collapses ``.`` / ``..`` lexically, rejects absolute paths and root escapes,
+    and fails closed on empty results so alias/traversal forms cannot bypass
+    overlap detection.
+    """
+    text = value.strip().replace("\\", "/")
+    if not text or text in {".", "/"}:
+        raise AdmissionFactsError("owned path must be a non-empty repository-relative path")
+    if text.startswith("/") or (len(text) >= 2 and text[1] == ":"):
+        raise AdmissionFactsError("owned path must be repository-relative, not absolute")
+    parts: list[str] = []
+    for part in text.split("/"):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if not parts:
+                raise AdmissionFactsError("owned path escapes repository root via '..'")
+            parts.pop()
+            continue
+        parts.append(part)
+    if not parts:
+        raise AdmissionFactsError("owned path resolves to an empty path")
+    return "/".join(parts)
+
+
+def canonicalize_worktree(value: str) -> str:
+    """Lexically canonicalize an absolute worktree path without filesystem I/O."""
+    text = value.strip().replace("\\", "/")
+    if not text.startswith("/"):
+        raise AdmissionFactsError("worktree must be an absolute path")
+    # posixpath.normpath collapses /tmp/x/../wt -> /tmp/wt without resolving symlinks.
+    normalized = posixpath.normpath(text)
+    if normalized != "/" and normalized.endswith("/"):
+        normalized = normalized.rstrip("/")
+    if normalized in {"", ".", "/"}:
+        raise AdmissionFactsError("worktree canonicalization produced an invalid path")
+    return normalized
+
+
+def paths_overlap(left: str, right: str) -> bool:
+    a = normalize_path(left)
+    b = normalize_path(right)
+    if a == b:
+        return True
+    a_prefix = a if a.endswith("/") else a + "/"
+    b_prefix = b if b.endswith("/") else b + "/"
+    return a.startswith(b_prefix) or b.startswith(a_prefix)
+
+
+def load_json_file(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise AdmissionFactsError(f"cannot read {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise AdmissionFactsError(f"malformed JSON in {path}: {exc}") from exc
+
+
+def parse_claim(raw: Any, *, label: str) -> dict[str, Any]:
+    data = _require_mapping(raw, label)
+    claim_id = _require_str(data.get("claim_id"), f"{label}.claim_id")
+    repository = _require_str(data.get("repository"), f"{label}.repository")
+    workstream = _require_str(data.get("workstream"), f"{label}.workstream")
+    intent_revision = _require_int(
+        data.get("intent_revision"), f"{label}.intent_revision", minimum=1
+    )
+    worktree = canonicalize_worktree(
+        _require_str(data.get("worktree"), f"{label}.worktree")
+    )
+    owned_paths_raw = _require_list(data.get("owned_paths", []), f"{label}.owned_paths")
+    owned_paths: list[str] = []
+    for index, item in enumerate(owned_paths_raw):
+        owned_paths.append(
+            normalize_path(_require_str(item, f"{label}.owned_paths[{index}]"))
+        )
+    status = _require_str(data.get("status", "CLAIMED"), f"{label}.status").upper()
+    if status not in KNOWN_CLAIM_STATUSES:
+        raise AdmissionFactsError(f"{label}.status is unknown: {status}")
+    shared_runtime = data.get("shared_runtime")
+    runtime: dict[str, Any] | None = None
+    if shared_runtime is not None:
+        runtime_map = _require_mapping(shared_runtime, f"{label}.shared_runtime")
+        runtime = {
+            "id": _require_str(runtime_map.get("id"), f"{label}.shared_runtime.id"),
+            "isolated": _require_bool(
+                runtime_map.get("isolated"), f"{label}.shared_runtime.isolated"
+            ),
+        }
+    return {
+        "claim_id": claim_id,
+        "repository": repository,
+        "workstream": workstream,
+        "intent_revision": intent_revision,
+        "worktree": worktree,
+        "owned_paths": owned_paths,
+        "status": status,
+        "shared_runtime": runtime,
+        "dirty": _require_bool(data.get("dirty", False), f"{label}.dirty"),
+        "unpushed": _require_bool(data.get("unpushed", False), f"{label}.unpushed"),
+        "ambiguous": _require_bool(data.get("ambiguous", False), f"{label}.ambiguous"),
+    }
+
+
+def parse_host_resource(raw: Any) -> dict[str, Any]:
+    data = _require_mapping(raw, "host_resource")
+    result = _require_str(data.get("result"), "host_resource.result").upper()
+    if result not in {"PASS", "WARN", "BLOCK"}:
+        raise AdmissionFactsError("host_resource.result must be PASS, WARN, or BLOCK")
+    exit_code = _require_int(data.get("exit_code"), "host_resource.exit_code", minimum=0)
+    if result in HOST_OK and exit_code != 0:
+        raise AdmissionFactsError("host_resource PASS/WARN requires exit_code 0")
+    if result == "BLOCK" and exit_code not in {2, 3}:
+        raise AdmissionFactsError("host_resource BLOCK requires exit_code 2 or 3")
+    return {"result": result, "exit_code": exit_code}
+
+
+def active_claims(claims: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [claim for claim in claims if claim["status"] in ACTIVE_CLAIM_STATUSES]
+
+
+def claim_identity_key(claim: dict[str, Any]) -> tuple[str, str, int]:
+    return (claim["repository"], claim["workstream"], claim["intent_revision"])
+
+
+def deny(reason: str, deny_class: str, **fields: Any) -> dict[str, str]:
+    payload = {
+        "DECISION": "DENY",
+        "EXIT_CODE": "2",
+        "REASON": reason,
+        "DENY_CLASS": deny_class,
+        "MUTATES_EXISTING_SESSIONS": "NO",
+    }
+    for key, value in fields.items():
+        payload[key] = str(value)
+    return payload
+
+
+def allow(reason: str, **fields: Any) -> dict[str, str]:
+    payload = {
+        "DECISION": "ALLOW",
+        "EXIT_CODE": "0",
+        "REASON": reason,
+        "DENY_CLASS": "NONE",
+        "MUTATES_EXISTING_SESSIONS": "NO",
+    }
+    for key, value in fields.items():
+        payload[key] = str(value)
+    return payload
+
+
+def evaluate_admit(request: dict[str, Any]) -> dict[str, str]:
+    proposed = parse_claim(request.get("proposed"), label="proposed")
+    existing_raw = _require_list(request.get("existing_claims", []), "existing_claims")
+    existing = [
+        parse_claim(item, label=f"existing_claims[{index}]")
+        for index, item in enumerate(existing_raw)
+    ]
+    host = parse_host_resource(request.get("host_resource"))
+    wip_limit = _require_int(request.get("wip_limit", 1), "wip_limit", minimum=1)
+
+    if proposed["ambiguous"]:
+        return deny(
+            "proposed claim is marked ambiguous",
+            "AMBIGUOUS_CLAIM",
+            PROPOSED_CLAIM_ID=proposed["claim_id"],
+            ACTIVE_CLAIM_COUNT=len(active_claims(existing)),
+            WIP_LIMIT=wip_limit,
+            HOST_RESOURCE_RESULT=host["result"],
+        )
+    if proposed["status"] not in ACTIVE_CLAIM_STATUSES:
+        return deny(
+            f"proposed claim status {proposed['status']} is not an active worker status",
+            "AMBIGUOUS_CLAIM",
+            PROPOSED_CLAIM_ID=proposed["claim_id"],
+            ACTIVE_CLAIM_COUNT=len(active_claims(existing)),
+            WIP_LIMIT=wip_limit,
+            HOST_RESOURCE_RESULT=host["result"],
+        )
+    if host["result"] not in HOST_OK:
+        return deny(
+            f"host resource admission blocked with result {host['result']} exit {host['exit_code']}",
+            "HOST_BUDGET",
+            PROPOSED_CLAIM_ID=proposed["claim_id"],
+            ACTIVE_CLAIM_COUNT=len(active_claims(existing)),
+            WIP_LIMIT=wip_limit,
+            HOST_RESOURCE_RESULT=host["result"],
+        )
+
+    live = active_claims(existing)
+    seen_ids: set[str] = set()
+    for claim in existing:
+        if claim["claim_id"] in seen_ids:
+            return deny(
+                f"duplicate claim_id {claim['claim_id']} in existing claims",
+                "AMBIGUOUS_CLAIM",
+                PROPOSED_CLAIM_ID=proposed["claim_id"],
+                ACTIVE_CLAIM_COUNT=len(live),
+                WIP_LIMIT=wip_limit,
+                HOST_RESOURCE_RESULT=host["result"],
+            )
+        seen_ids.add(claim["claim_id"])
+        if claim["ambiguous"] and claim["status"] in ACTIVE_CLAIM_STATUSES:
+            return deny(
+                f"existing claim {claim['claim_id']} is ambiguous",
+                "AMBIGUOUS_CLAIM",
+                PROPOSED_CLAIM_ID=proposed["claim_id"],
+                ACTIVE_CLAIM_COUNT=len(live),
+                WIP_LIMIT=wip_limit,
+                HOST_RESOURCE_RESULT=host["result"],
+            )
+
+    if proposed["claim_id"] in seen_ids:
+        return deny(
+            f"proposed claim_id {proposed['claim_id']} already exists",
+            "AMBIGUOUS_CLAIM",
+            PROPOSED_CLAIM_ID=proposed["claim_id"],
+            ACTIVE_CLAIM_COUNT=len(live),
+            WIP_LIMIT=wip_limit,
+            HOST_RESOURCE_RESULT=host["result"],
+        )
+
+    # Default remains sequential: a second active worker requires explicit room.
+    if live and len(live) >= wip_limit:
+        return deny(
+            f"active claims {len(live)} already meet wip_limit {wip_limit}",
+            "WIP_LIMIT",
+            PROPOSED_CLAIM_ID=proposed["claim_id"],
+            ACTIVE_CLAIM_COUNT=len(live),
+            WIP_LIMIT=wip_limit,
+            HOST_RESOURCE_RESULT=host["result"],
+        )
+
+    for claim in live:
+        # Host-wide: shared mutable runtimes conflict across repositories.
+        left_rt = proposed["shared_runtime"]
+        right_rt = claim["shared_runtime"]
+        if (
+            left_rt is not None
+            and right_rt is not None
+            and left_rt["id"] == right_rt["id"]
+            and (not left_rt["isolated"] or not right_rt["isolated"])
+        ):
+            return deny(
+                f"shared runtime {left_rt['id']} is not isolated for both claims",
+                "SHARED_RUNTIME",
+                PROPOSED_CLAIM_ID=proposed["claim_id"],
+                ACTIVE_CLAIM_COUNT=len(live),
+                WIP_LIMIT=wip_limit,
+                HOST_RESOURCE_RESULT=host["result"],
+            )
+
+        if claim["repository"] != proposed["repository"]:
+            continue
+        if claim["worktree"] == proposed["worktree"]:
+            return deny(
+                f"proposed worktree overlaps active claim {claim['claim_id']}",
+                "SHARED_WORKTREE",
+                PROPOSED_CLAIM_ID=proposed["claim_id"],
+                ACTIVE_CLAIM_COUNT=len(live),
+                WIP_LIMIT=wip_limit,
+                HOST_RESOURCE_RESULT=host["result"],
+            )
+        if claim_identity_key(claim) == claim_identity_key(proposed):
+            return deny(
+                "repository/workstream/intent_revision claim identity already held",
+                "OVERLAPPING_CLAIM",
+                PROPOSED_CLAIM_ID=proposed["claim_id"],
+                ACTIVE_CLAIM_COUNT=len(live),
+                WIP_LIMIT=wip_limit,
+                HOST_RESOURCE_RESULT=host["result"],
+            )
+        if (
+            claim["workstream"] == proposed["workstream"]
+            and claim["intent_revision"] != proposed["intent_revision"]
+        ):
+            return deny(
+                f"stale or conflicting intent_revision against claim {claim['claim_id']}",
+                "STALE_INTENT_REVISION",
+                PROPOSED_CLAIM_ID=proposed["claim_id"],
+                ACTIVE_CLAIM_COUNT=len(live),
+                WIP_LIMIT=wip_limit,
+                HOST_RESOURCE_RESULT=host["result"],
+            )
+        # Same-repo parallelism requires non-empty ownership facts on both sides.
+        if not proposed["owned_paths"] or not claim["owned_paths"]:
+            return deny(
+                "insufficient ownership facts to prove same-repository independence",
+                "INSUFFICIENT_OWNERSHIP",
+                PROPOSED_CLAIM_ID=proposed["claim_id"],
+                ACTIVE_CLAIM_COUNT=len(live),
+                WIP_LIMIT=wip_limit,
+                HOST_RESOURCE_RESULT=host["result"],
+            )
+        for left in proposed["owned_paths"]:
+            for right in claim["owned_paths"]:
+                if paths_overlap(left, right):
+                    return deny(
+                        f"owned path {left!r} overlaps claim {claim['claim_id']} path {right!r}",
+                        "OVERLAPPING_PATHS",
+                        PROPOSED_CLAIM_ID=proposed["claim_id"],
+                        ACTIVE_CLAIM_COUNT=len(live),
+                        WIP_LIMIT=wip_limit,
+                        HOST_RESOURCE_RESULT=host["result"],
+                    )
+
+    return allow(
+        "proposed worker is independent under claim/worktree/resource facts",
+        PROPOSED_CLAIM_ID=proposed["claim_id"],
+        ACTIVE_CLAIM_COUNT=len(live),
+        WIP_LIMIT=wip_limit,
+        HOST_RESOURCE_RESULT=host["result"],
+    )
+
+
+def evaluate_size(request: dict[str, Any]) -> dict[str, str]:
+    primary_outcome_count = _require_int(
+        request.get("primary_outcome_count"), "primary_outcome_count", minimum=1
+    )
+    adjacent_share_oracle = _require_bool(
+        request.get("adjacent_share_oracle"), "adjacent_share_oracle"
+    )
+    unrelated_domains = _require_bool(request.get("unrelated_domains"), "unrelated_domains")
+    distinct_approval_gates = _require_bool(
+        request.get("distinct_approval_gates"), "distinct_approval_gates"
+    )
+    unclear_rollback = _require_bool(request.get("unclear_rollback"), "unclear_rollback")
+    effort_band = _require_str(request.get("effort_band"), "effort_band").lower()
+    if effort_band not in EFFORT_BANDS:
+        raise AdmissionFactsError("effort_band must be micro, keep, or oversize")
+    context_budget_ok = _require_bool(request.get("context_budget_ok"), "context_budget_ok")
+    included_issue_count = _require_int(
+        request.get("included_issue_count", 1), "included_issue_count", minimum=1
+    )
+
+    split_reasons: list[str] = []
+    if primary_outcome_count > 1:
+        split_reasons.append("multiple primary outcomes")
+    if unrelated_domains:
+        split_reasons.append("unrelated domains")
+    if distinct_approval_gates:
+        split_reasons.append("distinct approval gates")
+    if unclear_rollback:
+        split_reasons.append("unclear rollback boundaries")
+    if effort_band == "oversize":
+        split_reasons.append("effort_band oversize")
+    if not context_budget_ok:
+        split_reasons.append("insufficient context budget for implementation plus validation")
+
+    if split_reasons:
+        decision = "SPLIT"
+        reason = "; ".join(split_reasons)
+    elif effort_band == "micro" and adjacent_share_oracle:
+        decision = "BATCH"
+        reason = "micro findings share subsystem/context/validation oracle"
+    else:
+        decision = "KEEP"
+        reason = "one coherent independently verifiable outcome"
+        if effort_band == "micro" and not adjacent_share_oracle:
+            reason = "lone micro finding has no adjacent batch partner; keep as one handoff"
+
+    return {
+        "DECISION": decision,
+        "EXIT_CODE": "0",
+        "REASON": reason,
+        "WORK_PACKET_SIZING": decision,
+        "PRIMARY_OUTCOME_COUNT": str(primary_outcome_count),
+        "EFFORT_BAND": effort_band,
+        "CONTEXT_BUDGET_OK": "YES" if context_budget_ok else "NO",
+        "INCLUDED_ISSUE_COUNT": str(included_issue_count),
+        "MUTATES_EXISTING_SESSIONS": "NO",
+    }
+
+
+def evaluate_release(request: dict[str, Any]) -> dict[str, str]:
+    action = _require_str(request.get("action"), "action").lower()
+    if action not in {"release-claim", "cleanup-worktree"}:
+        raise AdmissionFactsError("action must be release-claim or cleanup-worktree")
+    claim_id = _require_str(request.get("claim_id"), "claim_id")
+    existing_raw = _require_list(request.get("existing_claims", []), "existing_claims")
+    existing = [
+        parse_claim(item, label=f"existing_claims[{index}]")
+        for index, item in enumerate(existing_raw)
+    ]
+    matches = [claim for claim in existing if claim["claim_id"] == claim_id]
+    if not matches:
+        return deny(
+            f"claim_id {claim_id} not found",
+            "AMBIGUOUS_CLAIM",
+            ACTION=action,
+            CLAIM_ID=claim_id,
+        )
+    if len(matches) > 1:
+        return deny(
+            f"claim_id {claim_id} matches multiple records",
+            "AMBIGUOUS_CLAIM",
+            ACTION=action,
+            CLAIM_ID=claim_id,
+        )
+    claim = matches[0]
+    if claim["ambiguous"]:
+        return deny(
+            f"claim {claim_id} is ambiguous; reconcile before release",
+            "AMBIGUOUS_CLAIM",
+            ACTION=action,
+            CLAIM_ID=claim_id,
+        )
+    if action == "release-claim":
+        if claim["status"] not in RELEASEABLE_CLAIM_STATUSES:
+            return deny(
+                f"claim {claim_id} status {claim['status']} is not releasable",
+                "ACTIVE_CLAIM",
+                ACTION=action,
+                CLAIM_ID=claim_id,
+            )
+        return allow(
+            f"claim {claim_id} may release ownership without mutating unrelated sessions",
+            ACTION=action,
+            CLAIM_ID=claim_id,
+        )
+
+    # cleanup-worktree: never auto-delete dirty/ambiguous/unpushed state.
+    if claim["dirty"] or claim["unpushed"] or claim["ambiguous"]:
+        return deny(
+            f"refusing worktree cleanup for claim {claim_id} with dirty/unpushed/ambiguous state",
+            "UNSAFE_CLEANUP",
+            ACTION=action,
+            CLAIM_ID=claim_id,
+        )
+    if claim["status"] not in RELEASEABLE_CLAIM_STATUSES:
+        return deny(
+            f"claim {claim_id} status {claim['status']} is not cleanup-eligible",
+            "ACTIVE_CLAIM",
+            ACTION=action,
+            CLAIM_ID=claim_id,
+        )
+    return allow(
+        f"claim {claim_id} worktree cleanup is safe under reconciled facts",
+        ACTION=action,
+        CLAIM_ID=claim_id,
+    )
+
+
+def packet_not_runnable_reason(packet: Any) -> tuple[str, str] | None:
+    """One lifecycle invariant for selection and truthful persisted handoffs."""
+    blockers = packet.sections.get("Blockers", "").strip().upper()
+    if blockers not in {"NONE", "- NONE", "NONE."}:
+        return "PACKET_BLOCKER", "ACTIVE packet still records a blocker"
+    resolved = {"NONE", "N/A", "PASS", "COMPLETE", "RESOLVED", "CLEARED", "NO", "FALSE", "0", "NO_WAIT", "NOT_WAITING", "READY", "SUCCESS", "SATISFIED"}
+    for key in ("QUEUE_STATE", "WAITING_FOR", "DEPENDENCY_STATUS"):
+        value = packet.metadata.get(key, "").upper()
+        if value in resolved:
+            continue
+        if value and (
+            (key == "WAITING_FOR" and value not in resolved)
+            or "WAIT" in value
+            or value in {"BLOCKED", "DEFERRED", "HUMAN_REQUIRED", "PENDING", "YIELD", "YIELDED"}
+        ):
+            return "WAITING", "packet records a pending condition in " + key
+    for section in ("Current State", "Latest Evidence"):
+        fence: tuple[str, int] | None = None
+        for line in packet.sections.get(section, "").splitlines():
+            stripped = line.lstrip()
+            if stripped[:1] in {chr(96), "~"}:
+                char = stripped[0]
+                count = len(stripped) - len(stripped.lstrip(char))
+                if count >= 3:
+                    if fence is None:
+                        fence = (char, count)
+                    elif char == fence[0] and count >= fence[1] and not stripped[count:].strip():
+                        fence = None
+                    continue
+            if fence is not None:
+                continue
+            match = re.fullmatch(r"\s*(?:-\s*)?(WAITING_FOR_[A-Z0-9_]+)(?:=(.*))?\s*", line)
+            if match and (match.group(2) or "").strip().upper() not in resolved:
+                return "WAITING", "packet evidence records " + match.group(1) + "; reconcile observed readiness"
+    action = packet.sections.get("Next Action", "").strip()
+    if not action or action.upper() in {"NONE", "NONE.", "N/A"}:
+        return "NO_NEXT_ACTION", "ACTIVE packet has no executable next outcome"
+    return None
+
+
+def evaluate_eligible(payload: dict[str, Any]) -> dict[str, str]:
+    """Evaluate fresh repository-bound packet facts; never mutate or launch work."""
+    from context_epoch import analyze_packet, parse_packet
+
+    data = _require_mapping(payload, "request")
+    body = _require_str(data.get("body"), "body")
+    target = _require_str(data.get("expected_target_repo"), "expected_target_repo")
+    root = _require_str(data.get("profile_root"), "profile_root")
+    observed_head = _require_str(data.get("observed_head"), "observed_head").lower()
+    observed_branch = _require_str(data.get("observed_branch"), "observed_branch")
+    worktree = _require_str(data.get("observed_worktree"), "observed_worktree")
+    if len(observed_head) != 40 or any(c not in "0123456789abcdef" for c in observed_head):
+        raise AdmissionFactsError("observed_head must be a full Git SHA")
+    if not Path(root).is_absolute() or not Path(worktree).is_absolute():
+        raise AdmissionFactsError("profile_root and observed_worktree must be absolute paths")
+    issue_state = _require_str(data.get("issue_state"), "issue_state").upper()
+    if issue_state not in {"OPEN", "CLOSED"}:
+        raise AdmissionFactsError("issue_state must be OPEN or CLOSED")
+    ready = _require_bool(data.get("dependencies_ready"), "dependencies_ready")
+    waits = _require_list(data.get("waiting_for"), "waiting_for")
+    waits = [_require_str(value, "waiting_for item") for value in waits]
+    packet = parse_packet(body)
+    audit = analyze_packet(packet, profile_root=root, expected_target_repo=target)
+    if audit["blocking"]:
+        return deny("packet lint: " + ",".join(audit["blocking"]), "INVALID_PACKET")
+    if issue_state != "OPEN":
+        return deny("closed Issue is not runnable", "CLOSED_ISSUE")
+    if packet.metadata.get("STATUS") != "ACTIVE":
+        return deny("packet is not ACTIVE", "NOT_ACTIVE")
+    if Path(root).resolve() != Path(worktree).resolve():
+        return deny("profile root is not the observed worktree", "WORKTREE_MISMATCH")
+    if packet.metadata.get("BRANCH") != observed_branch:
+        return deny("packet branch differs from observed checkout", "BRANCH_MISMATCH")
+    if packet.metadata.get("LAST_VERIFIED_HEAD", "").lower() != observed_head:
+        return deny("packet HEAD is stale; reconcile from current evidence", "STALE_HEAD")
+    if not ready or waits:
+        return deny("observed dependencies or external condition are pending", "WAITING")
+    pending = packet_not_runnable_reason(packet)
+    if pending:
+        return deny(pending[1], pending[0])
+    return allow("repository-bound current-profile packet is runnable now")
+
+
+def _priority_result(
+    selection: str, reason: str, proposed: str, chosen: dict[str, Any] | None = None
+) -> dict[str, str]:
+    # Pure classification: the supplied candidate Issue bodies and Git observations
+    # must be freshly collected by the authenticated caller. This is not an Issue
+    # reader, trusted launcher, worker, or new execution authorization boundary.
+    fields = {
+        "SELECTION": selection,
+        "REASON": reason,
+        "PROPOSED_WORKSTREAM": proposed,
+        "FACT_AUTHORITY": "CALLER_SUPPLIED_ONLY",
+        "MUTATES_EXISTING_SESSIONS": "NO",
+    }
+    if chosen is not None:
+        packet = chosen["packet"]
+        fields.update({
+            "REQUIRED_WORKSTREAM": packet.metadata["WORKSTREAM"],
+            "ISSUE_NUMBER": str(chosen["issue_number"]),
+            "PRIORITY": chosen["priority"],
+            "INTENT_REVISION": packet.metadata.get("INTENT_REVISION", ""),
+            "NEXT_ACTION": next(
+                (line.strip() for line in packet.sections.get("Next Action", "").splitlines()
+                 if line.strip()), ""
+            ),
+        })
+    return fields
+
+
+def evaluate_priority_selection(payload: dict[str, Any]) -> dict[str, str]:
+    """Fail closed if the proposed work violates current owner/lock/priority facts.
+
+    Only for *already authenticated* Issue/HEAD observations in one repository.
+    Does not discover work or grant GitHub or product modification authority.
+    Owner focus takes precedence over an in-progress lock, then rank and oldest
+    GitHub Issue number decide between runnable workstreams.
+    """
+    from context_epoch import SAFE_WORKSTREAM_RE, parse_packet
+
+    data = _require_mapping(payload, "request")
+    target = _require_str(data.get("target_repository"), "target_repository")
+    proposed = _require_str(data.get("proposed_workstream"), "proposed_workstream")
+    owner_focus = data.get("owner_focus")
+    locked = data.get("locked_workstream")
+    for label, value in (
+        ("proposed_workstream", proposed), ("owner_focus", owner_focus),
+        ("locked_workstream", locked),
+    ):
+        if value is None:
+            continue
+        if not isinstance(value, str) or SAFE_WORKSTREAM_RE.fullmatch(value) is None:
+            raise AdmissionFactsError(f"{label} must be one valid workstream")
+    candidates = _require_list(data.get("candidates"), "candidates")
+    if not candidates:
+        return _priority_result("RECONCILE", "NO_CANDIDATES_VERIFIED", proposed)
+
+    eligible: list[dict[str, Any]] = []
+    nonrunnable: dict[str, str] = {}
+    observed: set[str] = set()
+    issue_numbers: set[int] = set()
+    scoped: set[str] = set()
+    for index, raw in enumerate(candidates):
+        try:
+            candidate = _require_mapping(raw, f"candidates[{index}]")
+            repository = _require_str(
+                candidate.get("expected_target_repo"), "expected_target_repo"
+            )
+            # Foreign-scope references are never scheduling candidates.
+            if repository != target:
+                continue
+            issue_number = _require_int(candidate.get("issue_number"), "issue_number", minimum=1)
+            packet = parse_packet(_require_str(candidate.get("body"), "body"))
+            workstream = _require_str(
+                packet.metadata.get("WORKSTREAM"), "WORKSTREAM"
+            )
+            if SAFE_WORKSTREAM_RE.fullmatch(workstream) is None:
+                raise AdmissionFactsError("invalid WORKSTREAM")
+            if issue_number in issue_numbers or workstream in observed:
+                return _priority_result("RECONCILE", "DUPLICATE_IDENTITY", proposed)
+            issue_numbers.add(issue_number)
+            observed.add(workstream)
+            scoped.add(workstream)
+            priority = packet.metadata.get("PRIORITY", "NORMAL")
+            if priority not in PRIORITY_RANK:
+                return _priority_result("RECONCILE", "INVALID_PRIORITY", proposed)
+            issue_state = _require_str(candidate.get("issue_state"), "issue_state").upper()
+            status = packet.metadata.get("STATUS")
+            if issue_state not in {"OPEN", "CLOSED"} or (
+                issue_state == "CLOSED" and status != "COMPLETE"
+            ) or (issue_state == "OPEN" and status == "COMPLETE"):
+                # A stale GitHub lifecycle is a reconciliation error, not a
+                # valid excuse to skip the highest-priority workstream.
+                return _priority_result(
+                    "RECONCILE", "INCONSISTENT_PACKET_LIFECYCLE", proposed
+                )
+            admission = evaluate_eligible(candidate)
+            if admission["DECISION"] == "ALLOW":
+                eligible.append({
+                    "issue_number": issue_number,
+                    "priority": priority,
+                    "packet": packet,
+                })
+            elif admission["DENY_CLASS"] in PRIORITY_NONRUNNABLE_DENIALS:
+                nonrunnable[workstream] = admission["DENY_CLASS"]
+                continue
+            else:
+                # Stale/invalid P0 must not silently vanish behind healthy P2.
+                return _priority_result("RECONCILE", "UNRECONCILED_CANDIDATE", proposed)
+        except (AdmissionFactsError, KeyError):
+            return _priority_result("RECONCILE", "UNRECONCILED_CANDIDATE", proposed)
+
+    if owner_focus is not None and owner_focus not in scoped:
+        return _priority_result("RECONCILE", "OWNER_FOCUS_NOT_OBSERVED", proposed)
+    if owner_focus is None and locked is not None and locked not in scoped:
+        return _priority_result("RECONCILE", "LOCKED_WORKSTREAM_NOT_OBSERVED", proposed)
+    if not eligible:
+        return _priority_result("RECONCILE", "NO_RUNNABLE_CANDIDATE", proposed)
+
+    by_workstream = {c["packet"].metadata["WORKSTREAM"]: c for c in eligible}
+    skipped_focus = None
+    if owner_focus is not None and owner_focus not in by_workstream:
+        # Verified waiting/blocked or terminal first action yields to
+        # independent runnable work without reinterpreting it as COMPLETE.
+        skipped_focus = owner_focus
+    if owner_focus in by_workstream:
+        chosen = by_workstream[owner_focus]
+    elif locked in by_workstream:
+        chosen = by_workstream[locked]
+    else:
+        chosen = min(
+            eligible,
+            key=lambda c: (PRIORITY_RANK[c["priority"]], c["issue_number"]),
+        )
+    decision = "ALLOW" if chosen["packet"].metadata["WORKSTREAM"] == proposed else "DENY"
+    reason = "PRIORITY_VERIFIED" if decision == "ALLOW" else "PRIORITY_DRIFT"
+    if decision == "ALLOW" and skipped_focus is not None:
+        reason = "VERIFIED_FOCUS_YIELDED"
+    result = _priority_result(decision, reason, proposed, chosen)
+    if skipped_focus is None and owner_focus is None and locked in nonrunnable:
+        skipped_focus = locked
+    if skipped_focus is not None:
+        result["SKIPPED_FOCUS"] = skipped_focus
+        result["SKIPPED_REASON"] = nonrunnable[skipped_focus]
+    return result
+
+
+def _turn_disposition(
+    disposition: str,
+    *,
+    final_allowed: bool,
+    reason: str,
+    request_scope: str,
+    scheduler_reconciled: bool,
+    remaining_state: str,
+    candidate_count: int,
+    runnable_candidate_count: int,
+) -> dict[str, str]:
+    if disposition not in {"CONTINUE", "RECONCILE", "ALLOW_FINAL", "BLOCKED"}:
+        raise AdmissionFactsError("unknown turn disposition")
+    if final_allowed != (disposition in {"ALLOW_FINAL", "BLOCKED"}):
+        raise AdmissionFactsError("turn disposition final_allowed mismatch")
+    return {
+        "TURN_DISPOSITION": disposition,
+        "FINAL_ALLOWED": "YES" if final_allowed else "NO",
+        "REASON": reason,
+        "REQUEST_SCOPE": request_scope,
+        "SCHEDULER_RECONCILED": "YES" if scheduler_reconciled else "NO",
+        "REMAINING_STATE": remaining_state,
+        "CANDIDATE_COUNT": str(candidate_count),
+        "RUNNABLE_CANDIDATE_COUNT": str(runnable_candidate_count),
+        # An optional classifier cannot certify an exhaustive GitHub roadmap
+        # from caller facts. In particular ALLOW_FINAL only ends this turn.
+        "ROADMAP_COMPLETE": (
+            "NO" if disposition == "CONTINUE"
+            or (
+                candidate_count > 0
+                and remaining_state in {"NO_SAFE_RUNNABLE", "OWNER_REQUIRED", "IRRECONCILABLE"}
+            )
+            else "NOT_VERIFIED"
+        ),
+        "MUTATES_EXISTING_SESSIONS": "NO",
+    }
+
+
+def evaluate_disposition(request: dict[str, Any]) -> dict[str, str]:
+    """Classify supplied continue/resume scheduling facts, not a ChatGPT response.
+
+    This optional pure oracle does not discover GitHub state itself, launch
+    work, prevent model final answers, or keep a chat alive. The caller must first reconcile fresh
+    repository/work-packet facts and supply each candidate through the same
+    eligible contract used for normal runnable selection.
+    """
+    data = _require_mapping(request, "request")
+    request_scope = _require_str(data.get("request_scope"), "request_scope").lower()
+    if request_scope not in TURN_REQUEST_SCOPES:
+        raise AdmissionFactsError(
+            "request_scope must be repository, workstream, or status-only"
+        )
+
+    # A status-only request never implied execution continuation.
+    if request_scope == "status-only":
+        return _turn_disposition(
+            "ALLOW_FINAL",
+            final_allowed=True,
+            reason="owner requested status only; no execution continuation is implied",
+            request_scope=request_scope,
+            scheduler_reconciled=False,
+            remaining_state="COMPLETE",
+            candidate_count=0,
+            runnable_candidate_count=0,
+        )
+
+    target_repository = _require_str(data.get("target_repository"), "target_repository")
+    target_workstream = None
+    if request_scope == "workstream":
+        target_workstream = _require_str(data.get("target_workstream"), "target_workstream")
+
+    scheduler_value = data.get("scheduler_reconciled")
+    scheduler_hint = (
+        False
+        if scheduler_value is None
+        else _require_bool(scheduler_value, "scheduler_reconciled")
+    )
+    candidates_raw = _require_list(
+        data.get("runnable_candidates", []), "runnable_candidates"
+    )
+    roadmap_raw = _require_list(
+        data.get("roadmap_runnable_work", []), "roadmap_runnable_work"
+    )
+    roadmap_work: list[str] = []
+    for index, item in enumerate(roadmap_raw):
+        workstream = _require_str(item, f"roadmap_runnable_work[{index}]")
+        if workstream in roadmap_work:
+            raise AdmissionFactsError(
+                f"roadmap_runnable_work contains duplicate workstream {workstream!r}"
+            )
+        if request_scope == "workstream" and workstream != target_workstream:
+            continue
+        roadmap_work.append(workstream)
+
+    runnable = len(roadmap_work)
+    reconcile_required = False
+    pending_candidate_count = 0
+    scoped_candidate_count = 0
+    from context_epoch import SAFE_WORKSTREAM_RE, parse_packet
+    for index, item in enumerate(candidates_raw):
+        try:
+            candidate = _require_mapping(item, f"runnable_candidates[{index}]")
+            candidate_repository = _require_str(
+                candidate.get("expected_target_repo"),
+                f"runnable_candidates[{index}].expected_target_repo",
+            )
+            if candidate_repository != target_repository:
+                continue
+            if request_scope == "workstream":
+                body = _require_str(
+                    candidate.get("body"), f"runnable_candidates[{index}].body"
+                )
+                packet = parse_packet(body)
+                candidate_workstream = packet.metadata.get("WORKSTREAM", "")
+                if (
+                    "WORKSTREAM" in packet.duplicate_metadata
+                    or not candidate_workstream
+                    or SAFE_WORKSTREAM_RE.fullmatch(candidate_workstream) is None
+                ):
+                    # Workstream identity is the scope boundary. If it is missing,
+                    # duplicated, or invalid, the candidate cannot be safely
+                    # classified as out-of-scope; require reconciliation.
+                    scoped_candidate_count += 1
+                    reconcile_required = True
+                    continue
+                if candidate_workstream != target_workstream:
+                    continue
+            scoped_candidate_count += 1
+            result = evaluate_eligible(candidate)
+        except AdmissionFactsError:
+            # One malformed/stale in-scope dependency must not suppress
+            # independent runnable work. Preserve it as reconciliation evidence.
+            reconcile_required = True
+            continue
+        if result.get("DECISION") == "ALLOW":
+            runnable += 1
+        elif result.get("DENY_CLASS") in TURN_RECONCILE_DENY_CLASSES:
+            reconcile_required = True
+        elif result.get("DENY_CLASS") in {"WAITING", "PACKET_BLOCKER"}:
+            pending_candidate_count += 1
+
+    candidate_count = scoped_candidate_count + len(roadmap_work)
+
+    # Independent runnable work always wins over a blocked/waiting lane.
+    # Packetless roadmap work is intentionally representable: packet creation is
+    # continuity bookkeeping, not a prerequisite for clear owner-authorized work.
+    if runnable:
+        return _turn_disposition(
+            "CONTINUE",
+            final_allowed=False,
+            reason="dependency-eligible packet or roadmap work remains",
+            request_scope=request_scope,
+            scheduler_reconciled=scheduler_hint,
+            remaining_state="UNKNOWN",
+            candidate_count=candidate_count,
+            runnable_candidate_count=runnable,
+        )
+
+    # A supplied candidate whose identity/HEAD/lifecycle facts are stale cannot
+    # be collapsed into "no runnable work". Reconcile before any terminal state.
+    if reconcile_required:
+        return _turn_disposition(
+            "RECONCILE",
+            final_allowed=False,
+            reason="candidate facts require reconciliation before terminal disposition",
+            request_scope=request_scope,
+            scheduler_reconciled=False,
+            remaining_state="UNKNOWN",
+            candidate_count=candidate_count,
+            runnable_candidate_count=0,
+        )
+
+    if scheduler_value is None:
+        raise AdmissionFactsError(
+            "scheduler_reconciled is required when no runnable candidate was supplied"
+        )
+    scheduler_reconciled = scheduler_hint
+    remaining_state = _require_str(
+        data.get("remaining_state"), "remaining_state"
+    ).upper()
+    if remaining_state not in TURN_REMAINING_STATES:
+        raise AdmissionFactsError(
+            "remaining_state must be COMPLETE, NO_SAFE_RUNNABLE, OWNER_REQUIRED, "
+            "IRRECONCILABLE, or UNKNOWN"
+        )
+
+    if not scheduler_reconciled or remaining_state == "UNKNOWN":
+        return _turn_disposition(
+            "RECONCILE",
+            final_allowed=False,
+            reason="repository-level scheduling is not yet reconciled to a terminal state",
+            request_scope=request_scope,
+            scheduler_reconciled=scheduler_reconciled,
+            remaining_state=remaining_state,
+            candidate_count=candidate_count,
+            runnable_candidate_count=0,
+        )
+
+    if remaining_state == "COMPLETE" and request_scope == "repository" and candidate_count == 0:
+        return _turn_disposition(
+            "RECONCILE",
+            final_allowed=False,
+            reason="empty repository candidate inventory cannot prove roadmap completion",
+            request_scope=request_scope,
+            scheduler_reconciled=False,
+            remaining_state="UNKNOWN",
+            candidate_count=0,
+            runnable_candidate_count=0,
+        )
+
+    if remaining_state == "COMPLETE" and pending_candidate_count:
+        return _turn_disposition(
+            "RECONCILE",
+            final_allowed=False,
+            reason="pending in-scope candidates contradict COMPLETE remaining state",
+            request_scope=request_scope,
+            scheduler_reconciled=False,
+            remaining_state="UNKNOWN",
+            candidate_count=candidate_count,
+            runnable_candidate_count=0,
+        )
+
+    if remaining_state == "COMPLETE":
+        return _turn_disposition(
+            "ALLOW_FINAL",
+            final_allowed=True,
+            reason="requested execution objective is complete after fresh reconciliation",
+            request_scope=request_scope,
+            scheduler_reconciled=True,
+            remaining_state=remaining_state,
+            candidate_count=candidate_count,
+            runnable_candidate_count=0,
+        )
+
+    if remaining_state == "NO_SAFE_RUNNABLE":
+        return _turn_disposition(
+            "ALLOW_FINAL",
+            final_allowed=True,
+            reason="fresh reconciliation found no safe dependency-eligible runnable work",
+            request_scope=request_scope,
+            scheduler_reconciled=True,
+            remaining_state=remaining_state,
+            candidate_count=candidate_count,
+            runnable_candidate_count=0,
+        )
+
+    return _turn_disposition(
+        "BLOCKED",
+        final_allowed=True,
+        reason=(
+            "genuine owner input/credential/approval is required"
+            if remaining_state == "OWNER_REQUIRED"
+            else "an irreconcilable blocker remains after fresh reconciliation"
+        ),
+        request_scope=request_scope,
+        scheduler_reconciled=True,
+        remaining_state=remaining_state,
+        candidate_count=candidate_count,
+        runnable_candidate_count=0,
+    )
+
+
+def format_report(fields: dict[str, str], keys: tuple[str, ...]) -> str:
+    lines = []
+    for key in keys:
+        if key not in fields:
+            continue
+        value = fields[key].replace("\n", " ").strip()
+        lines.append(f"{key}={value}")
+    for key, value in fields.items():
+        if key in keys:
+            continue
+        lines.append(f"{key}={value.replace(chr(10), ' ').strip()}")
+    return "\n".join(lines) + "\n"
+
+
+def failure_report(reason: str, deny_class: str = "AMBIGUOUS_FACTS") -> tuple[str, int]:
+    text = format_report(
+        {
+            "DECISION": "DENY",
+            "EXIT_CODE": "3",
+            "REASON": reason,
+            "DENY_CLASS": deny_class,
+            "MUTATES_EXISTING_SESSIONS": "NO",
+        },
+        REPORT_KEYS_ADMIT,
+    )
+    return text, 3
+
+
+def run_command(command: str, payload: dict[str, Any]) -> tuple[str, int]:
+    if command == "select":
+        report = evaluate_priority_selection(payload)
+        code = {"ALLOW": 0, "DENY": 2, "RECONCILE": 3}[report["SELECTION"]]
+        return format_report(report, REPORT_KEYS_PRIORITY), code
+    if command == "eligible":
+        report = evaluate_eligible(payload)
+        return format_report(report, REPORT_KEYS_ADMIT), int(report["EXIT_CODE"])
+    if command == "disposition":
+        report = evaluate_disposition(payload)
+        return format_report(report, REPORT_KEYS_DISPOSITION), 0
+    if command == "admit":
+        report = evaluate_admit(payload)
+        return format_report(report, REPORT_KEYS_ADMIT), int(report["EXIT_CODE"])
+    if command == "size":
+        report = evaluate_size(payload)
+        return format_report(report, REPORT_KEYS_SIZE), int(report["EXIT_CODE"])
+    if command == "release":
+        report = evaluate_release(payload)
+        return format_report(report, REPORT_KEYS_RELEASE), int(report["EXIT_CODE"])
+    raise AdmissionFactsError(f"unknown command {command}")
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "command",
+        choices=("select", "eligible", "disposition", "admit", "size", "release"),
+        help="Priority selection, runnable/turn disposition, admission, sizing, or claim cleanup",
+    )
+    parser.add_argument(
+        "--request-json",
+        required=True,
+        help="JSON file of machine-readable packet/claim/resource/sizing facts",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        payload = load_json_file(Path(args.request_json))
+        if not isinstance(payload, dict):
+            raise AdmissionFactsError("request JSON must be an object")
+        text, code = run_command(args.command, payload)
+    except AdmissionFactsError as exc:
+        text, code = failure_report(exc.reason, exc.deny_class)
+    sys.stdout.write(text)
+    return code
+
+
+if __name__ == "__main__":
+    # Fact evaluation only; never stop/kill/mutate existing worker sessions.
+    raise SystemExit(main())
