@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="README.md">English</a> · <strong>한국어</strong> · <a href="https://stellar-relay.xdr.ooo/ko">제품 문서</a>
+  <a href="README.md">English</a> · <strong>한국어</strong> · <a href="https://stellar-relay.isoc.ooo/ko">제품 문서</a>
 </p>
 
 ---
@@ -30,7 +30,7 @@ Stellar Relay는 **Stellar Cyber Alert와 Case**를 TCP 기반 NDJSON으로 전�
 ## 빠른 시작
 
 ```bash
-git clone https://github.com/xdr-labs/Stellar-Case-Alert-to-Sylog.git
+git clone https://github.com/isoc-labs/stellar-relay.git
 cd Stellar-Case-Alert-to-Sylog
 
 python3 Stellar_Alert_Case_Syslog.py
@@ -155,7 +155,7 @@ Backfill은 normal checkpoint를 무시하고 historical record를 다시 보낼
 
 현재 Operator Guide:
 
-**https://stellar-relay.xdr.ooo/ko**
+**https://stellar-relay.isoc.ooo/ko**
 
 Quickstart, Configuration, systemd 운영, Output Format, Troubleshooting은 위 문서를 기준으로 합니다.
 

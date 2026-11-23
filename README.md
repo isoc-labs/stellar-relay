@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <strong>English</strong> · <a href="README.ko.md">한국어</a> · <a href="https://stellar-relay.xdr.ooo/">Product Website</a>
+  <strong>English</strong> · <a href="README.ko.md">한국어</a> · <a href="https://stellar-relay.isoc.ooo/">Product Website</a>
 </p>
 
 <p align="center">
@@ -49,7 +49,7 @@ flowchart LR
 Clone the repository:
 
 ```bash
-git clone https://github.com/xdr-labs/Stellar-Case-Alert-to-Sylog.git
+git clone https://github.com/isoc-labs/stellar-relay.git
 cd Stellar-Case-Alert-to-Sylog
 ```
 
@@ -198,7 +198,7 @@ Backfill intentionally ignores normal checkpoints and can resend historical reco
 
 The operator-focused guide is maintained at:
 
-**https://stellar-relay.xdr.ooo/**
+**https://stellar-relay.isoc.ooo/**
 
 It contains the current Quickstart, configuration reference, service operations, output format, and troubleshooting guidance.
 
